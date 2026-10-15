@@ -2,6 +2,7 @@
 # 박자 반전! 백스테이지 - pygame 리듬 게임
 # 실행: python main.py
 
+import asyncio
 import math
 import os
 import random
@@ -11,15 +12,16 @@ import time
 import pygame
 
 import chart
-import sound_maker
 from game_logic import RhythmGame
 
 # ---------------- 기본 설정 ----------------
 WIDTH, HEIGHT = 960, 640
 FPS = 60
+WEB = sys.platform == "emscripten"   # 웹 브라우저에서 실행 중인지 (pygbag)
 # 소리가 스피커에서 실제로 들리기까지 걸리는 시간(초).
-# 노트를 박자에 맞게 눌렀는데 판정이 늦거나 빠르게 느껴지면 이 값을 0.0~0.12 사이에서 조절한다.
-AUDIO_LATENCY = 0.03
+# 노트를 박자에 맞게 눌렀는데 판정이 늦거나 빠르게 느껴지면 이 값을 조절한다.
+# 게임 시작 화면에서 - / + 키로도 바꿀 수 있다. (브라우저는 소리 지연이 더 길다)
+AUDIO_LATENCY = 0.08 if WEB else 0.03
 
 LANE_W = 84
 LANE_LEFT = (WIDTH - LANE_W * 4) // 2      # 레인 4개를 화면 가운데에
@@ -45,6 +47,7 @@ MODE_INFO = {
 JUDGE_COLORS = {"PERFECT": GOLD, "GOOD": (90, 220, 255), "MISS": (255, 90, 100)}
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SOUND_NAMES = ["song", "perfect", "good", "miss", "alert", "select"]   # sound_maker.SOUND_FILES와 같다
 
 
 def lane_x(lane):
@@ -69,12 +72,17 @@ def mix(c1, c2, k):
 
 
 def load_font(size, bold=False):
-    """한글이 깨지지 않도록 Windows의 맑은 고딕을 우선 사용한다."""
+    """한글이 깨지지 않도록 Windows의 맑은 고딕을 우선 사용하고,
+    없으면(웹 브라우저, 맥 등) 게임 폴더에 들어 있는 나눔고딕을 사용한다."""
     names = ["malgunbd.ttf", "malgun.ttf"] if bold else ["malgun.ttf"]
     for name in names:
         path = os.path.join("C:/Windows/Fonts", name)
         if os.path.exists(path):
             return pygame.font.Font(path, size)
+    nanum = "NanumGothic-Bold.ttf" if bold else "NanumGothic-Regular.ttf"
+    path = os.path.join(BASE_DIR, "assets", "fonts", nanum)
+    if os.path.exists(path):
+        return pygame.font.Font(path, size)
     return pygame.font.SysFont("malgungothic,applegothic,nanumgothic", size, bold=bold)
 
 
@@ -88,7 +96,8 @@ class Button:
 # =====================================================================
 class App:
     def __init__(self):
-        pygame.mixer.pre_init(44100, -16, 2, 512)   # 작은 버퍼 = 소리 지연 감소
+        # 작은 버퍼 = 소리 지연 감소 (브라우저는 소리가 끊기지 않도록 조금 크게)
+        pygame.mixer.pre_init(44100, -16, 2, 1024 if WEB else 512)
         pygame.init()
         pygame.display.set_caption("박자 반전! 백스테이지")
         self.screen = pygame.display.set_mode((WIDTH, HEIGHT))
@@ -115,7 +124,9 @@ class App:
         self.start_button = Button((620, 545), (260, 58), "▶  공연 리허설 시작")
         self.sound_button = Button((620, 600), (200, 36), "")
         self.retry_button = Button((520, 560), (230, 56), "다시 시작하기 (R)")
-        self.quit_button = Button((770, 560), (200, 56), "종료하기 (Esc)")
+        # 웹에서는 창을 닫을 수 없으므로 '종료하기' 대신 처음 화면으로 돌아간다
+        self.quit_button = Button((770, 560), (200, 56), "처음 화면 (Esc)" if WEB else "종료하기 (Esc)")
+        self.latency = AUDIO_LATENCY
         self.reset_effects()
 
     # ---------------- 준비 ----------------
@@ -150,9 +161,16 @@ class App:
         try:
             if not pygame.mixer.get_init():
                 pygame.mixer.init()
-            sound_maker.ensure_sounds()
-            for name in sound_maker.SOUND_FILES:
-                self.sounds[name] = pygame.mixer.Sound(sound_maker.sound_path(name))
+            if WEB:
+                # 웹: 브라우저가 지원하는 OGG 파일 사용 (build_web.py가 미리 변환해 둔다)
+                for name in SOUND_NAMES:
+                    self.sounds[name] = pygame.mixer.Sound(os.path.join(BASE_DIR, "assets", name + ".ogg"))
+            else:
+                # 소리를 만드는 sound_maker는 웹 브라우저에 없는 wave 모듈을 쓰므로 PC에서만 불러온다
+                import sound_maker
+                sound_maker.ensure_sounds()     # PC: 소리 파일이 없으면 만든다
+                for name in sound_maker.SOUND_FILES:
+                    self.sounds[name] = pygame.mixer.Sound(sound_maker.sound_path(name))
             pygame.mixer.set_num_channels(16)
             pygame.mixer.set_reserved(1)                # 0번 채널은 음악 전용
             self.song_channel = pygame.mixer.Channel(0)
@@ -196,8 +214,8 @@ class App:
         if self.fake_time is not None:
             return self.fake_time
         if self.paused:
-            return self.paused_at - self.song_start - AUDIO_LATENCY
-        return time.perf_counter() - self.song_start - AUDIO_LATENCY
+            return self.paused_at - self.song_start - self.latency
+        return time.perf_counter() - self.song_start - self.latency
 
     # ---------------- 게임 흐름 ----------------
     def start_play(self):
@@ -231,6 +249,13 @@ class App:
             pygame.mixer.stop()
         self.state = "title"
 
+    def quit_or_title(self):
+        """PC에서는 게임 종료, 웹에서는 처음 화면으로"""
+        if WEB:
+            self.go_title()
+            return True
+        return False
+
     # ---------------- 입력 ----------------
     def handle_event(self, e):
         if e.type == pygame.QUIT:
@@ -247,7 +272,11 @@ class App:
                 if e.key in (pygame.K_RETURN, pygame.K_SPACE):
                     self.play_sfx("select")
                     self.start_play()
-                elif e.key == pygame.K_ESCAPE:
+                elif e.key in (pygame.K_MINUS, pygame.K_KP_MINUS):
+                    self.latency = max(-0.1, round(self.latency - 0.01, 2))   # 박자 보정: 판정을 빠르게
+                elif e.key in (pygame.K_EQUALS, pygame.K_PLUS, pygame.K_KP_PLUS):
+                    self.latency = min(0.3, round(self.latency + 0.01, 2))    # 박자 보정: 판정을 늦게
+                elif e.key == pygame.K_ESCAPE and not WEB:
                     return False
             elif e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
                 if self.start_button.rect.collidepoint(e.pos):
@@ -275,13 +304,13 @@ class App:
                     self.play_sfx("select")
                     self.start_play()
                 elif e.key in (pygame.K_ESCAPE, pygame.K_q):
-                    return False
+                    return self.quit_or_title()
             elif e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
                 if self.retry_button.rect.collidepoint(e.pos):
                     self.play_sfx("select")
                     self.start_play()
                 elif self.quit_button.rect.collidepoint(e.pos):
-                    return False
+                    return self.quit_or_title()
         return True
 
     def press_key(self, key_lane):
@@ -828,6 +857,9 @@ class App:
         self.draw_button(self.start_button, GOLD)
         self.draw_button(self.sound_button, (150, 140, 180), "소리: ON  [M]" if self.sound_on else "소리: OFF  [M]")
         self.blit_center(self.text("Enter / Space로도 시작", 12, (150, 140, 170), False), (870, 545))
+        ms = int(round(self.latency * 1000))
+        self.blit_center(self.text(f"박자 보정 {ms:+d}ms", 12, (150, 140, 170), False), (850, 592))
+        self.blit_center(self.text("( - / + 키 )", 12, (150, 140, 170), False), (850, 608))
 
     def draw_result(self):
         t = self.app_time
@@ -871,7 +903,8 @@ class App:
             self.draw_result()
 
     # ---------------- 메인 루프 ----------------
-    def run(self):
+    # async: 웹 브라우저(pygbag)에서도 멈추지 않고 돌아가도록 매 프레임 브라우저에 차례를 넘겨준다
+    async def run(self):
         running = True
         while running:
             dt = min(self.clock.tick(FPS) / 1000, 0.05)
@@ -881,9 +914,13 @@ class App:
             self.update(dt)
             self.draw()
             pygame.display.flip()
+            await asyncio.sleep(0)
         pygame.quit()
 
 
+async def main():
+    await App().run()
+
+
 if __name__ == "__main__":
-    App().run()
-    sys.exit()
+    asyncio.run(main())
